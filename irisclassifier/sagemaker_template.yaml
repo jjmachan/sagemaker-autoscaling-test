@@ -1,0 +1,181 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: An API Gateway to invoke Sagemaker Endpoint
+Resources:
+  SagemakerModel:
+    Type: 'AWS::SageMaker::Model'
+    Properties:
+      ModelName: sagemakertest-model-20211025195410-2490FD
+      ExecutionRoleArn: !GetAtt 
+        - ExecutionRole
+        - Arn
+      PrimaryContainer:
+        Image: >-
+          213386773652.dkr.ecr.us-west-1.amazonaws.com/sagemakertest-repo:irisclassifier-20211025195410_2490fd
+        ImageConfig:
+          RepositoryAccessMode: Platform
+        Environment:
+          BENTOML_GUNICORN_TIMEOUT: 60
+          BENTOML_GUNICORN_NUM_OF_WORKERS: 3
+  ExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSageMakerFullAccess'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - sagemaker.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+  SagemakerEndpointConfig:
+    Type: 'AWS::SageMaker::EndpointConfig'
+    DependsOn: SagemakerModel
+    Properties:
+      DataCaptureConfig:
+        EnableCapture: false
+        InitialSamplingPercentage: 100
+        DestinationS3Uri: 's3://bucket-name/optional/predix'
+        CaptureOptions:
+          - CaptureMode: Input
+          - CaptureMode: Output
+      ProductionVariants:
+        - InitialInstanceCount: 1
+          InitialVariantWeight: 1
+          InstanceType: ml.t2.medium
+          ModelName: !GetAtt 
+            - SagemakerModel
+            - ModelName
+          VariantName: default
+  SagemakerEndpoint:
+    Type: 'AWS::SageMaker::Endpoint'
+    DependsOn: SagemakerEndpointConfig
+    Properties:
+      EndpointConfigName: !GetAtt 
+        - SagemakerEndpointConfig
+        - EndpointConfigName
+      EndpointName: sagemakertest-endpoint
+      RetainAllVariantProperties: false
+  HttpApi:
+    Type: 'AWS::ApiGatewayV2::Api'
+    Properties:
+      Name: sagemakertest-api
+      Description: API Gateway proxy to lambda function that exposes sagemaker endpoint
+      ProtocolType: HTTP
+  HttpApiIntegration:
+    Type: 'AWS::ApiGatewayV2::Integration'
+    DependsOn:
+      - Lambdafn
+    Properties:
+      Description: Lambda Integration
+      IntegrationMethod: POST
+      IntegrationUri: !Sub >-
+        arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Lambdafn.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+  DefaultStage:
+    Type: 'AWS::ApiGatewayV2::Stage'
+    Properties:
+      StageName: $default
+      AutoDeploy: true
+      ApiId: !Ref HttpApi
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSageMakerFullAccess'
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+  Lambdafn:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Runtime: python3.9
+      Description: Parse request and invoke Sagmeker Endpoint
+      Timeout: 60
+      Role: !Sub '${LambdaExecutionRole.Arn}'
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+
+          import json
+          import boto3
+          from base64 import b64decode
+
+          def safeget(dct, *keys, default=None):
+              for key in keys:
+                  try:
+                      dct = dct[key]
+                  except KeyError:
+                      return default
+              return dct
+
+          def lambda_handler(event, context):
+              runtime = boto3.client('runtime.sagemaker')
+
+              try:
+                  sagemaker_response = runtime.invoke_endpoint(
+                      EndpointName="sagemakertest-endpoint",
+                      ContentType=safeget(event, 'headers', 'content-type', default='application/json'),
+                      CustomAttributes=safeget(event, 'rawPath', default='')[1:],
+                      Body=b64decode(event.get('body')) if event.get('isBase64Encoded') else event.get('body')
+                  )
+              except Exception as e:
+                  return {
+                      'statusCode': e.response.get('OriginalStatusCode'),
+                      'body': e.response.get('Error')['Message']
+                  }
+              else:
+                  return {
+                      'statusCode': safeget(sagemaker_response, 'ResponseMetadata', 'HTTPStatusCode'),
+                      'body': sagemaker_response.get('Body').read()
+                  }
+      TracingConfig:
+        Mode: Active
+  ApigatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt 
+        - Lambdafn
+        - Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/*'
+  nextpredictroute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    DependsOn:
+      - HttpApiIntegration
+      - Lambdafn
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /nextpredict
+      Target: !Join 
+        - /
+        - - integrations
+          - !Ref HttpApiIntegration
+  predictroute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    DependsOn:
+      - HttpApiIntegration
+      - Lambdafn
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /predict
+      Target: !Join 
+        - /
+        - - integrations
+          - !Ref HttpApiIntegration
+Outputs:
+  EndpointURL:
+    Value: !Sub '${HttpApi.ApiEndpoint}'
+    Description: The endpoint for Sagemaker inference
